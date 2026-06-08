@@ -1,0 +1,29 @@
+# Cache files
+scraper/products_cache.json
+scraper/products_embedded_cache.json
+scraper/checkpoint.state
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+scraper/.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test files (not needed in production)
+scraper/test_scraper.py

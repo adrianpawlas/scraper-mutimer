@@ -1,0 +1,79 @@
+name: Mutimer Scraper
+
+on:
+  schedule:
+    # Wednesday and Sunday at 3:30 PM UTC (adjust for your timezone)
+    # UTC 15:30 = 16:30 CET winter / 17:30 CEST summer
+    - cron: '30 15 * * 3,0'
+  workflow_dispatch:
+    inputs:
+      skip_scrape:
+        description: 'Skip scraping (load from cache)'
+        type: boolean
+        default: false
+      skip_embeddings:
+        description: 'Skip embedding generation'
+        type: boolean
+        default: false
+      skip_upload:
+        description: 'Skip uploading to Supabase'
+        type: boolean
+        default: false
+
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+  # Disable tokenizers parallelism warning
+  TOKENIZERS_PARALLELISM: 'false'
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    # 2-hour timeout for the full pipeline (model download + embeddings)
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libgl1-mesa-glx  # Required by OpenCV/Pillow
+
+      - name: Cache HuggingFace models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: ${{ runner.os }}-huggingface-${{ hashFiles('scraper/config.py') }}
+          restore-keys: |
+            ${{ runner.os }}-huggingface-
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r scraper/requirements.txt
+
+      - name: Run scraper
+        working-directory: scraper
+        run: |
+          ARGS=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            [ "${{ inputs.skip_scrape }}" = "true" ] && ARGS="$ARGS --skip-scrape"
+            [ "${{ inputs.skip_embeddings }}" = "true" ] && ARGS="$ARGS --skip-embeddings"
+            [ "${{ inputs.skip_upload }}" = "true" ] && ARGS="$ARGS --skip-upload"
+          fi
+          echo "Running: python3 main.py $ARGS"
+          python3 main.py $ARGS
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-logs
+          path: scraper/*.log
+          retention-days: 7
