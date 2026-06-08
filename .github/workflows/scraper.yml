@@ -40,10 +40,6 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq libgl1-mesa-glx  # Required by OpenCV/Pillow
 
       - name: Cache HuggingFace models
         uses: actions/cache@v4
