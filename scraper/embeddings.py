@@ -3,6 +3,9 @@ Embedding generation using google/siglip-base-patch16-384.
 
 Generates 768-dim embeddings for both images and text using the
 SIGLIP multimodal model from HuggingFace.
+
+Supports staggered generation with configurable delay between batches
+to avoid overwhelming system resources.
 """
 
 import io
@@ -16,7 +19,7 @@ import torch
 from PIL import Image
 from transformers import AutoProcessor, SiglipModel
 
-from config import MODEL_ID, BATCH_SIZE, REQUEST_DELAY
+from config import MODEL_ID, BATCH_SIZE, EMBEDDING_DELAY
 
 logger = logging.getLogger(__name__)
 
@@ -53,11 +56,11 @@ def _load_model():
 def download_image(url: str, timeout: int = 30) -> Optional[Image.Image]:
     """
     Download an image from a URL.
-    
+
     Args:
         url: Image URL
         timeout: Request timeout in seconds
-    
+
     Returns:
         PIL Image or None on failure
     """
@@ -77,10 +80,10 @@ def download_image(url: str, timeout: int = 30) -> Optional[Image.Image]:
 def get_image_embedding(image_url: str) -> Optional[list[float]]:
     """
     Generate a 768-dim SIGLIP embedding for a single image.
-    
+
     Args:
         image_url: URL of the image to embed
-    
+
     Returns:
         List of 768 floats, or None on failure
     """
@@ -95,7 +98,6 @@ def get_image_embedding(image_url: str) -> Optional[list[float]]:
 
         with torch.no_grad():
             outputs = model.get_image_features(**inputs)
-            # get_image_features returns BaseModelOutputWithPooling, pooler_output has the 768-dim embedding
             embeddings = outputs.pooler_output
             # L2 normalize
             embeddings = embeddings / embeddings.norm(p=2, dim=-1, keepdim=True)
@@ -109,10 +111,10 @@ def get_image_embedding(image_url: str) -> Optional[list[float]]:
 def get_text_embedding(text: str) -> Optional[list[float]]:
     """
     Generate a 768-dim SIGLIP text embedding.
-    
+
     Args:
         text: Text to embed (e.g., product title + description)
-    
+
     Returns:
         List of 768 floats, or None on failure
     """
@@ -132,7 +134,6 @@ def get_text_embedding(text: str) -> Optional[list[float]]:
 
         with torch.no_grad():
             outputs = model.get_text_features(**inputs)
-            # get_text_features returns BaseModelOutputWithPooling, pooler_output has the 768-dim embedding
             embeddings = outputs.pooler_output
             # L2 normalize
             embeddings = embeddings / embeddings.norm(p=2, dim=-1, keepdim=True)
@@ -143,124 +144,131 @@ def get_text_embedding(text: str) -> Optional[list[float]]:
         return None
 
 
-def process_product_embeddings(products: list[dict]) -> list[dict]:
+def _build_info_text(product: dict) -> str:
+    """Build a combined info text from product fields for text embedding."""
+    info_parts = []
+    if product.get("title"):
+        info_parts.append(f"Title: {product['title']}")
+    if product.get("description"):
+        info_parts.append(f"Description: {product['description']}")
+    if product.get("category"):
+        info_parts.append(f"Category: {product['category']}")
+    if product.get("gender"):
+        info_parts.append(f"Gender: {product['gender']}")
+    if product.get("price"):
+        info_parts.append(f"Price: {product['price']}")
+    if product.get("size"):
+        info_parts.append(f"Sizes: {product['size']}")
+    if product.get("tags"):
+        info_parts.append(f"Tags: {', '.join(product['tags'])}")
+    return " | ".join(info_parts)
+
+
+def process_product_embeddings(
+    products: list[dict],
+) -> list[dict]:
     """
-    Process embeddings for a list of products concurrently.
-    
-    For each product:
-        - Downloads the main image and generates image_embedding
-        - Generates info_embedding from product text data
-    
+    Generate SIGLIP embeddings for a list of products.
+
+    Only generates embeddings for products that have an image_url.
+    Adds a staggered delay (EMBEDDING_DELAY) between batches to
+    avoid overwhelming system resources.
+
     Args:
         products: List of product dicts (must have image_url, title, etc.)
-    
+
     Returns:
-        Updated products with embedding fields populated
+        Updated products with 'image_embedding' and 'info_embedding' populated
     """
-    logger.info(f"Processing embeddings for {len(products)} products...")
+    if not products:
+        return products
 
-    # Process in batches using ThreadPoolExecutor for I/O-bound image downloads
-    with ThreadPoolExecutor(max_workers=min(BATCH_SIZE, 10)) as executor:
-        future_to_product = {}
+    logger.info(f"Generating embeddings for {len(products)} products...")
 
-        for idx, product in enumerate(products):
-            # Build info text for text embedding
-            info_parts = []
-            if product.get("title"):
-                info_parts.append(f"Title: {product['title']}")
-            if product.get("description"):
-                info_parts.append(f"Description: {product['description']}")
-            if product.get("category"):
-                info_parts.append(f"Category: {product['category']}")
-            if product.get("gender"):
-                info_parts.append(f"Gender: {product['gender']}")
-            if product.get("price"):
-                info_parts.append(f"Price: {product['price']}")
-            if product.get("size"):
-                info_parts.append(f"Sizes: {product['size']}")
-            if product.get("tags"):
-                info_parts.append(f"Tags: {', '.join(product['tags'])}")
-            product["_info_text"] = " | ".join(info_parts)
-
-            # Submit image download task
-            future = executor.submit(download_image, product.get("image_url", ""))
-            future_to_product[future] = idx
-
-        # Collect downloaded images
-        downloaded_images = {}
-        for future in as_completed(future_to_product):
-            idx = future_to_product[future]
-            try:
-                img = future.result()
-                if img:
-                    downloaded_images[idx] = img
-            except Exception as e:
-                logger.warning(f"Failed to download image for product {idx}: {e}")
-
-    # Now generate embeddings in batches (batched GPU processing is more efficient)
     model, processor = _load_model()
     batch_size = min(BATCH_SIZE, 4)  # Smaller batches for GPU memory
+    total = len(products)
+    processed = 0
 
-    # Image embeddings
-    product_indices = list(downloaded_images.keys())
-    for start_idx in range(0, len(product_indices), batch_size):
-        batch_indices = product_indices[start_idx:start_idx + batch_size]
-        batch_images = [downloaded_images[i] for i in batch_indices]
+    for batch_start in range(0, total, batch_size):
+        batch = products[batch_start : batch_start + batch_size]
 
-        try:
-            inputs = processor(images=batch_images, return_tensors="pt").to(_device)
-            with torch.no_grad():
-                outputs = model.get_image_features(**inputs)
-                # BaseModelOutputWithPooling -> pooler_output gives 768-dim embeddings
-                embeddings = outputs.pooler_output
-                embeddings = embeddings / embeddings.norm(p=2, dim=-1, keepdim=True)
+        # --- Image embeddings ---
+        downloaded_images = []
+        valid_indices = []
 
-            for batch_pos, orig_idx in enumerate(batch_indices):
-                products[orig_idx]["image_embedding"] = embeddings[batch_pos].cpu().tolist()
-        except Exception as e:
-            logger.error(f"Batch image embedding failed at batch {start_idx}: {e}")
-            for orig_idx in batch_indices:
-                products[orig_idx]["image_embedding"] = None
+        for idx, product in enumerate(batch):
+            image_url = product.get("image_url")
+            if not image_url:
+                continue
 
-    # Text embeddings (batch processing)
-    text_indices = [
-        i for i, p in enumerate(products)
-        if p.get("_info_text")
-    ]
+            img = download_image(image_url)
+            if img is not None:
+                downloaded_images.append(img)
+                valid_indices.append(idx)
 
-    for start_idx in range(0, len(text_indices), batch_size):
-        batch_indices = text_indices[start_idx:start_idx + batch_size]
-        batch_texts = [products[i]["_info_text"] for i in batch_indices]
+        if downloaded_images:
+            try:
+                inputs = processor(images=downloaded_images, return_tensors="pt").to(_device)
+                with torch.no_grad():
+                    outputs = model.get_image_features(**inputs)
+                    embeddings = outputs.pooler_output
+                    embeddings = embeddings / embeddings.norm(p=2, dim=-1, keepdim=True)
 
-        try:
-            inputs = processor(
-                text=batch_texts,
-                return_tensors="pt",
-                padding="max_length",
-                max_length=64,
-                truncation=True,
-            ).to(_device)
+                for pos, orig_idx in enumerate(valid_indices):
+                    product_idx = batch_start + orig_idx
+                    products[product_idx]["image_embedding"] = embeddings[pos].cpu().tolist()
 
-            with torch.no_grad():
-                outputs = model.get_text_features(**inputs)
-                # BaseModelOutputWithPooling -> pooler_output gives 768-dim embeddings
-                embeddings = outputs.pooler_output
-                embeddings = embeddings / embeddings.norm(p=2, dim=-1, keepdim=True)
+                logger.debug(
+                    f"Image embeddings: batch {batch_start // batch_size + 1}/"
+                    f"{(total + batch_size - 1) // batch_size} "
+                    f"({len(downloaded_images)} images)"
+                )
+            except Exception as e:
+                logger.error(f"Image embedding batch failed at {batch_start}: {e}")
 
-            for batch_pos, orig_idx in enumerate(batch_indices):
-                products[orig_idx]["info_embedding"] = embeddings[batch_pos].cpu().tolist()
-        except Exception as e:
-            logger.error(f"Batch text embedding failed at batch {start_idx}: {e}")
-            for orig_idx in batch_indices:
-                products[orig_idx]["info_embedding"] = None
+        # --- Text embeddings ---
+        text_inputs = []
+        text_indices = []
+        for idx, product in enumerate(batch):
+            info_text = _build_info_text(product)
+            if info_text.strip():
+                text_inputs.append(info_text)
+                text_indices.append(idx)
 
-    # Clean up temp fields
-    for p in products:
-        p.pop("_info_text", None)
+        if text_inputs:
+            try:
+                inputs = processor(
+                    text=text_inputs,
+                    return_tensors="pt",
+                    padding="max_length",
+                    max_length=64,
+                    truncation=True,
+                ).to(_device)
 
-    # Log stats
-    with_embeddings = sum(1 for p in products if p.get("image_embedding"))
-    logger.info(f"Generated image embeddings for {with_embeddings}/{len(products)} products")
+                with torch.no_grad():
+                    outputs = model.get_text_features(**inputs)
+                    embeddings = outputs.pooler_output
+                    embeddings = embeddings / embeddings.norm(p=2, dim=-1, keepdim=True)
+
+                for pos, orig_idx in enumerate(text_indices):
+                    product_idx = batch_start + orig_idx
+                    products[product_idx]["info_embedding"] = embeddings[pos].cpu().tolist()
+            except Exception as e:
+                logger.error(f"Text embedding batch failed at {batch_start}: {e}")
+
+        processed += len(batch)
+        logger.debug(f"Embedding progress: {processed}/{total}")
+
+        # Staggered delay between batches (except after the last one)
+        if batch_start + batch_size < total:
+            logger.debug(f"Waiting {EMBEDDING_DELAY}s before next batch...")
+            time.sleep(EMBEDDING_DELAY)
+
+    # Stats
+    with_img = sum(1 for p in products if p.get("image_embedding"))
+    with_txt = sum(1 for p in products if p.get("info_embedding"))
+    logger.info(f"Image embeddings: {with_img}/{total} | Text embeddings: {with_txt}/{total}")
 
     return products
 

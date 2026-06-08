@@ -4,12 +4,16 @@ Mutimer Fashion Store Scraper - Main Orchestrator
 
 Pipeline:
 1. Scrape all products from Shopify collections API
-2. Generate SIGLIP image and text embeddings
-3. Upsert everything to Supabase
+2. Fetch existing products from Supabase
+3. Classify products: new / changed-image / changed-data / unchanged
+4. Generate SIGLIP embeddings only for new + image-changed products
+5. Upsert only changed products to Supabase (50/batch, 3 retries)
+6. Handle stale products (delete after 2 consecutive missed runs)
+7. Print run summary
 
 Usage:
     python main.py [--skip-scrape] [--skip-embeddings] [--skip-upload]
-    
+
 Options:
     --skip-scrape       Skip scraping, load from cache file
     --skip-embeddings   Skip embedding generation
@@ -28,7 +32,15 @@ from datetime import datetime, timezone
 from config import SOURCE
 from shopify_scraper import scrape_all_products
 from embeddings import process_product_embeddings, refine_products_after_embedding
-from supabase_db import upsert_products, verify_import, get_product_count
+from supabase_db import (
+    fetch_all_products,
+    classify_products,
+    batch_upsert,
+    handle_stale_products,
+    print_run_summary,
+    verify_import,
+    get_product_count,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,16 +50,17 @@ logging.basicConfig(
 logger = logging.getLogger("main")
 
 SCRAPE_CACHE = "products_cache.json"
-EMBEDDING_CACHE = "products_embedded_cache.json"
+EMBEDDED_SUBSET_CACHE = "products_embedded_cache.json"
 CHECKPOINT_FILE = "checkpoint.state"
 
 CHECKPOINT_SCRAPED = "scraped"
+CHECKPOINT_CLASSIFIED = "classified"
 CHECKPOINT_EMBEDDED = "embedded"
 CHECKPOINT_UPLOADED = "uploaded"
 
 
 def save_cache(products: list[dict], filename: str = SCRAPE_CACHE):
-    """Save scraped products to a local cache file."""
+    """Save products to a local cache file."""
     with open(filename, "w", encoding="utf-8") as f:
         json.dump(products, f, ensure_ascii=False, indent=2)
     logger.info(f"Saved {len(products)} products to {filename}")
@@ -63,14 +76,12 @@ def load_cache(filename: str = SCRAPE_CACHE) -> list[dict]:
 
 
 def save_checkpoint(stage: str):
-    """Save the current pipeline stage as a checkpoint."""
     with open(CHECKPOINT_FILE, "w") as f:
         f.write(stage)
-    logger.info(f"Checkpoint saved: {stage}")
+    logger.debug(f"Checkpoint saved: {stage}")
 
 
 def load_checkpoint() -> str | None:
-    """Load the last checkpoint stage, or None."""
     if not os.path.exists(CHECKPOINT_FILE):
         return None
     with open(CHECKPOINT_FILE, "r") as f:
@@ -78,10 +89,9 @@ def load_checkpoint() -> str | None:
 
 
 def clear_checkpoint():
-    """Remove the checkpoint file."""
     if os.path.exists(CHECKPOINT_FILE):
         os.remove(CHECKPOINT_FILE)
-        logger.info("Checkpoint cleared")
+        logger.debug("Checkpoint cleared")
 
 
 def run_pipeline(
@@ -90,7 +100,7 @@ def run_pipeline(
     skip_upload=False,
     resume=False,
 ):
-    """Run the full scraping pipeline with checkpointing."""
+    """Run the full smart scraping pipeline."""
     start_time = time.time()
     logger.info("=" * 60)
     logger.info("MUTIMER FASHION STORE SCRAPER")
@@ -99,89 +109,139 @@ def run_pipeline(
         logger.info("Mode: RESUME from last checkpoint")
     logger.info("=" * 60)
 
-    # Determine where to resume from
     last_checkpoint = load_checkpoint() if resume else None
     if last_checkpoint:
         logger.info(f"Resuming from checkpoint: {last_checkpoint}")
 
-    products = []
-
-    # Step 1: Scrape products
-    if skip_scrape or last_checkpoint in (CHECKPOINT_EMBEDDED, CHECKPOINT_UPLOADED):
-        logger.info("Step 1: Loading products from cache (--skip-scrape or resuming)...")
+    # ── Step 1: Scrape products ──────────────────────────────────────────
+    if skip_scrape or last_checkpoint in (CHECKPOINT_CLASSIFIED, CHECKPOINT_EMBEDDED, CHECKPOINT_UPLOADED):
+        logger.info("Step 1: Loading products from cache...")
         products = load_cache()
         if not products:
-            # Try embedded cache
-            products = load_cache(EMBEDDING_CACHE)
+            products = load_cache(EMBEDDED_SUBSET_CACHE)
+        if not products:
+            logger.error("No cached products found. Run without --skip-scrape first.")
+            return
     else:
         logger.info("Step 1: Scraping products from Shopify API...")
         products = scrape_all_products()
         save_cache(products, SCRAPE_CACHE)
         save_checkpoint(CHECKPOINT_SCRAPED)
 
-    logger.info(f"Total products loaded: {len(products)}")
-    if not products:
-        logger.error("No products found. Aborting.")
-        return
+    logger.info(f"Total scraped products: {len(products)}")
 
-    # Step 2: Generate embeddings
-    if skip_embeddings or last_checkpoint == CHECKPOINT_UPLOADED:
-        logger.info("Step 2: Loading pre-computed embeddings from cache (--skip-embeddings or resuming)...")
-        # If resuming after upload, load the embedded cache
-        if last_checkpoint == CHECKPOINT_UPLOADED:
-            cached = load_cache(EMBEDDING_CACHE)
-            if cached:
-                products = cached
-            else:
-                logger.warning("No embedded cache found, re-generating embeddings...")
-                products = process_product_embeddings(products)
-                products = refine_products_after_embedding(products)
-                save_cache(products, EMBEDDING_CACHE)
-                save_checkpoint(CHECKPOINT_EMBEDDED)
+    # ── Step 2: Fetch existing DB products & classify ────────────────────
+    db_products = []
+    classification = None
+
+    if not skip_upload:
+        logger.info("Step 2: Fetching existing products from Supabase...")
+        db_products = fetch_all_products()
+
+        logger.info("Classifying products against database...")
+        classification = classify_products(products, db_products)
+        save_checkpoint(CHECKPOINT_CLASSIFIED)
+
+        # Determine which products need embeddings
+        products_to_embed = classification["new"] + classification["changed_image"]
+        logger.info(
+            f"Products needing embeddings: {len(products_to_embed)} "
+            f"({len(classification['new'])} new + {len(classification['changed_image'])} image-changed)"
+        )
+
+        # Products that need DB updates but no re-embedding
+        products_to_update_db = classification["new"] + classification["changed_image"] + classification["changed_data"]
+
+        logger.info(
+            f"Products needing DB updates: {len(products_to_update_db)} "
+            f"({len(classification['new'])} new + {len(classification['changed_image'])} image + "
+            f"{len(classification['changed_data'])} data)"
+        )
     else:
-        logger.info("Step 2: Generating SIGLIP embeddings...")
-        products = process_product_embeddings(products)
-        products = refine_products_after_embedding(products)
-        logger.info(f"Products with valid embeddings: {len(products)}")
-        save_cache(products, EMBEDDING_CACHE)
+        # When skipping upload, we still embed everything (legacy behavior)
+        products_to_embed = products
+        products_to_update_db = products
+
+    # ── Step 3: Generate embeddings (only for new + image-changed) ───────
+    if skip_embeddings or last_checkpoint == CHECKPOINT_UPLOADED:
+        logger.info("Step 3: Skipping embedding generation")
+    elif not products_to_embed:
+        logger.info("Step 3: No products need embedding — all up to date")
+    else:
+        logger.info(f"Step 3: Generating SIGLIP embeddings for {len(products_to_embed)} products...")
+        process_product_embeddings(products_to_embed)
+
+        # Save the embedded subset cache for resume
+        if skip_upload:
+            # If not uploading, save what we embedded for later
+            all_embedded = []
+            # Merge embeddings back into the full set
+            url_to_embedded = {}
+            for p in products_to_embed:
+                if p.get("image_embedding"):
+                    url_to_embedded[p.get("product_url")] = {
+                        "image_embedding": p.get("image_embedding"),
+                        "info_embedding": p.get("info_embedding"),
+                    }
+            for p in products:
+                pu = p.get("product_url")
+                if pu in url_to_embedded:
+                    p["image_embedding"] = url_to_embedded[pu]["image_embedding"]
+                    p["info_embedding"] = url_to_embedded[pu]["info_embedding"]
+                elif pu not in {x.get("product_url") for x in products_to_embed}:
+                    # Preserve any existing embeddings from cache
+                    pass
+            save_cache(products, EMBEDDED_SUBSET_CACHE)
+
         save_checkpoint(CHECKPOINT_EMBEDDED)
 
-    # Step 3: Upload to Supabase
+    # ── Step 4: Upsert to Supabase ───────────────────────────────────────
     if skip_upload:
-        logger.info("Step 3: Skipping upload (--skip-upload)")
+        logger.info("Step 4: Skipping upload (--skip-upload)")
+        upsert_result = {"upserted": 0, "failed": 0}
+        stale_result = {"deleted": 0, "newly_missed": 0}
     else:
-        logger.info("Step 3: Uploading to Supabase...")
-        result = upsert_products(products)
-        logger.info(f"Upload result: {result}")
+        logger.info(f"Step 4: Upserting {len(products_to_update_db)} products to Supabase...")
+        upsert_result = batch_upsert(products_to_update_db)
+
+        # ── Step 5: Handle stale products ──────────────────────────────
+        logger.info("Step 5: Checking for stale products...")
+        stale_result = handle_stale_products(
+            classification["seen_urls"],
+            db_products,
+        )
+
         save_checkpoint(CHECKPOINT_UPLOADED)
 
-    # Summary
+        # ── Step 6: Print summary ──────────────────────────────────────
+        print_run_summary(classification, upsert_result, stale_result)
+
+    # ── Elapsed time ──────────────────────────────────────────────────────
     elapsed = time.time() - start_time
-    logger.info("=" * 60)
-    logger.info("PIPELINE COMPLETE")
     logger.info(f"Elapsed time: {elapsed:.2f}s")
 
-    # Verify
-    logger.info("\n--- Verification ---")
-    verify_results = verify_import(limit=3)
-    if verify_results:
-        logger.info("Import verified. Sample records from Supabase:")
-        for rec in verify_results:
-            title = rec.get("title", "N/A")
-            pid = rec.get("id", "N/A")
-            has_img = rec.get("image_embedding") is not None
-            has_info = rec.get("info_embedding") is not None
-            logger.info(
-                f"  - {title} (id: {pid}) | "
-                f"img_emb: {'✓' if has_img else '✗'} | "
-                f"info_emb: {'✓' if has_info else '✗'}"
-            )
-    else:
-        logger.warning("Verification returned no records. Import may have failed.")
+    # ── Verification ──────────────────────────────────────────────────────
+    if not skip_upload:
+        logger.info("\n--- Verification ---")
+        verify_results = verify_import(limit=3)
+        if verify_results:
+            logger.info("Import verified. Sample records from Supabase:")
+            for rec in verify_results:
+                title = rec.get("title", "N/A")
+                pid = rec.get("id", "N/A")
+                has_img = rec.get("image_embedding") is not None
+                has_info = rec.get("info_embedding") is not None
+                logger.info(
+                    f"  - {title} (id: {pid}) | "
+                    f"img_emb: {'✓' if has_img else '✗'} | "
+                    f"info_emb: {'✓' if has_info else '✗'}"
+                )
+        else:
+            logger.warning("Verification returned no records. Import may have failed.")
 
-    count = get_product_count()
-    if count is not None:
-        logger.info(f"Total products in Supabase for '{SOURCE}': {count}")
+        count = get_product_count()
+        if count is not None:
+            logger.info(f"Total products in Supabase for '{SOURCE}': {count}")
 
     clear_checkpoint()
     logger.info("=" * 60)

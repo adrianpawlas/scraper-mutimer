@@ -44,8 +44,11 @@ VECTOR_DIM = 768
 
 # Batch processing
 BATCH_SIZE = 10  # Number of products to process in parallel for embeddings
-UPLOAD_BATCH_SIZE = 25  # Number of products to upsert to Supabase at once
+UPLOAD_BATCH_SIZE = 50  # Number of products to upsert to Supabase at once
 REQUEST_DELAY = 0.5  # Delay between API requests in seconds
+EMBEDDING_DELAY = 0.5  # Delay between embedding generations in seconds
+STALE_RUNS_THRESHOLD = 2  # Consecutive missing runs before product is deleted
+MAX_UPSERT_RETRIES = 3  # Max retries for batch upsert operations
 
 # Currency conversion
 BASE_CURRENCY = "CZK"
