@@ -109,39 +109,6 @@ def parse_category(product: dict) -> str:
     
     return ", ".join(categories)
 
-
-def parse_gender(product: dict) -> Optional[str]:
-    """
-    Determine gender from product title, tags, and description.
-    
-    Returns:
-        "unisex" or None (if no clear signal)
-    """
-    title = product.get("title", "").lower()
-    tags = [tag.lower() for tag in product.get("tags", []) if isinstance(tag, str)]
-    body = strip_html(product.get("body_html", "")).lower()
-    
-    combined = f"{title} {' '.join(tags)} {body}"
-    
-    female_words = {"women", "woman", "female", "girls", "girl", "her"}
-    male_words = {"men", "man", "male", "boys", "boy", "him", "his"}
-    unisex_words = {"unisex", "everyone", "all genders"}
-    
-    has_female = any(w in combined for w in female_words)
-    has_male = any(w in combined for w in male_words)
-    has_unisex = any(w in combined for w in unisex_words)
-    
-    if has_unisex:
-        return "unisex"
-    if has_female and not has_male:
-        return "female"
-    if has_male and not has_female:
-        return "male"
-    if has_female and has_male:
-        return "unisex"
-    return None  # Unknown
-
-
 def parse_sizes(product: dict) -> Optional[str]:
     """
     Extract size information from product variants.
@@ -308,8 +275,8 @@ def map_product(product: dict) -> dict:
     # Build category
     category = parse_category(product)
     
-    # Determine gender
-    gender = parse_gender(product)
+    # Gender is always NULL for this brand
+    gender = None
     
     # Build metadata
     metadata = build_metadata(product)
