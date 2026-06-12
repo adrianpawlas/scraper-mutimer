@@ -69,6 +69,72 @@ def _fetch_exchange_rates() -> dict:
     return rates
 
 
+def get_aud_to_czk_rate() -> float:
+    """
+    Fetch the AUD to CZK exchange rate from the API.
+    
+    Ensures the main CZK→target rates cache is populated first to avoid
+    cache collisions with _fetch_exchange_rates.
+    """
+    global _exchange_rates_cache, _cache_timestamp
+
+    now = time.time()
+    if _exchange_rates_cache and (now - _cache_timestamp) < _CACHE_TTL:
+        if "_AUD_TO_CZK" in _exchange_rates_cache:
+            return _exchange_rates_cache["_AUD_TO_CZK"]
+
+    # Ensure the main CZK→target rates are cached first
+    _fetch_exchange_rates()
+
+    # Now try to fetch AUD→CZK rate
+    rate = None
+
+    # Try frankfurter.app first
+    try:
+        url = "https://api.frankfurter.app/latest?from=AUD&to=CZK"
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        rates = data.get("rates", {})
+        if "CZK" in rates:
+            rate = rates["CZK"]
+    except Exception as e:
+        logger.warning(f"Failed to fetch AUD→CZK rate: {e}")
+
+    # Try open.er-api.com as fallback
+    if rate is None:
+        try:
+            url = "https://open.er-api.com/v6/latest/AUD"
+            resp = requests.get(url, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            rates = data.get("rates", {})
+            if "CZK" in rates:
+                rate = rates["CZK"]
+        except Exception as e:
+            logger.error(f"Fallback AUD→CZK API also failed: {e}")
+
+    # Hardcoded fallback: approximately 1 AUD = 14.5 CZK
+    if rate is None:
+        rate = 14.5
+        logger.warning(f"Using fallback AUD→CZK rate: {rate}")
+    else:
+        logger.info(f"Fetched AUD→CZK rate: {rate}")
+
+    # Store in the existing cache dict
+    if _exchange_rates_cache is not None:
+        _exchange_rates_cache["_AUD_TO_CZK"] = rate
+    return rate
+
+
+def convert_aud_to_czk(price_aud: float) -> float:
+    """
+    Convert a price from AUD to CZK using the live exchange rate.
+    """
+    rate = get_aud_to_czk_rate()
+    return price_aud * rate
+
+
 def format_price_with_currency(price_czk: float) -> str:
     """
     Convert a CZK price to multiple currencies and format the output.

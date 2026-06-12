@@ -142,6 +142,9 @@ def parse_price_info(product: dict) -> tuple[Optional[str], Optional[str]]:
     """
     Parse price and sale information from product variants.
     
+    The Shopify API returns prices in the store's base currency (AUD).
+    These are first converted to CZK, then formatted in multiple currencies.
+    
     Args:
         product: Raw product dict
     
@@ -150,7 +153,7 @@ def parse_price_info(product: dict) -> tuple[Optional[str], Optional[str]]:
         - price_str: CZK price formatted for multiple currencies (e.g., "20.90EUR, 450CZK, 75PLN")
         - sale_str: Sale price string (same format) or None if no sale
     """
-    from currency_utils import format_price_with_currency
+    from currency_utils import format_price_with_currency, convert_aud_to_czk
     
     variants = product.get("variants", [])
     if not variants:
@@ -160,24 +163,27 @@ def parse_price_info(product: dict) -> tuple[Optional[str], Optional[str]]:
     first_variant = variants[0]
     
     try:
-        price_czk = float(first_variant.get("price", 0))
+        price_aud = float(first_variant.get("price", 0))
         compare_at = first_variant.get("compare_at_price")
     except (ValueError, TypeError):
         return None, None
     
-    if not price_czk:
+    if not price_aud:
         return None, None
+    
+    # Convert from AUD (Shopify base currency) to CZK
+    price_czk = convert_aud_to_czk(price_aud)
     
     # Check if there's a sale (compare_at_price > price)
     is_on_sale = False
     sale_price_czk = None
     if compare_at is not None:
         try:
-            compare_at_val = float(compare_at)
-            if compare_at_val > 0 and compare_at_val > price_czk:
+            compare_at_aud = float(compare_at)
+            if compare_at_aud > 0 and compare_at_aud > price_aud:
                 is_on_sale = True
                 sale_price_czk = price_czk
-                price_czk = compare_at_val  # Original price is compare_at_price
+                price_czk = convert_aud_to_czk(compare_at_aud)  # Original price is compare_at_price
         except (ValueError, TypeError):
             pass
     
